@@ -29,6 +29,7 @@ class CircularReplayBuffer(object):
                  history=4,
                  obs_shape=(1, 84, 84),
                  obs_dtype=torch.uint8,
+                 seed=2,
                  device='cpu') -> None:
         """
         Initializing the circular replay buffer. Assumes that the observation
@@ -65,6 +66,8 @@ class CircularReplayBuffer(object):
         self._done_buffer = torch.empty(self.capacity, dtype=torch.bool,
                                         device=self._device)
 
+        self.rng = np.random.RandomState(seed=seed)
+
     def push(self, observ: torch.tensor, action: torch.tensor,
              reward: torch.tensor, done: torch.tensor) -> None:
         """
@@ -92,14 +95,15 @@ class CircularReplayBuffer(object):
         # TODO?: modify such one cannot sample index i where done[i-1]==True
         #   this is because if i is the last obs of successor state then the
         #   previous state is completely absent
-        indeces = np.random.choice(self.size, size=n, replace=False)
+        indeces = self.rng.choice(self.size, size=n, replace=False)
 
         # Get the buffered experiences
         state_batch, next_state_batch = self.encode_states(indeces)
         act_batch = self._act_buffer[indeces]
         rew_batch = self._rew_buffer[indeces]
+        don_batch = self._done_buffer[indeces]
 
-        return state_batch, act_batch, rew_batch, next_state_batch
+        return state_batch, act_batch, rew_batch, next_state_batch, don_batch
 
     def encode_states(self, idxs: np.ndarray) -> (torch.tensor, torch.tensor):
         """
