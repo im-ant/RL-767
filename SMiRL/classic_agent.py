@@ -174,7 +174,7 @@ class FnnQAgent(object):
         # TODO use tensorboard.add_custom_scalars(layout)
         # https://pytorch.org/docs/stable/tensorboard.html
         # To add hyperparameters used
-        
+
 
     def _init(self):
         """Temporary function to initialize things"""
