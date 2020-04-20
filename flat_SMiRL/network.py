@@ -78,7 +78,7 @@ class nature_dqn_network(nn.Module):
 
 class mlp_network(nn.Module):
     """
-    Simple feed-forward network
+    Simple feed-forward network with 2 hidden layers
     """
 
     def __init__(self,
