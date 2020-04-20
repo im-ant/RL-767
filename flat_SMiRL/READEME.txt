@@ -1,0 +1,9 @@
+Some scripts for the SMiRL algorithm implementation with Q learning.
+Takes only *flat* inputs.
+
+I am considering alternatives (e.g. conv nets) because many VAE implementations
+use bernoulli output, which requires the range [0,1]. I cannot make
+the same assumption when I am giving the agent state data.
+
+Alternatively I can implement a VAE with Gaussian output. However this is running into training
+stability issues that I do not have a good solution for currently.
