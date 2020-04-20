@@ -22,6 +22,7 @@ import numpy as np
 
 class MiniGridFlatWrapper(gym.core.Wrapper):
     def __init__(self, env,
+                 use_tensor=True,
                  scale_observation=True,
                  scale_min=0.0,
                  scale_max=10.0):
@@ -29,12 +30,18 @@ class MiniGridFlatWrapper(gym.core.Wrapper):
         Initializes the environment wrapper
         :param env: assumed to be a raw MiniGrid environment without
                     additional wrappers
+        :param use_tensor: whether use a flat (n,) vector observation, or
+                           a (1, n) tensor observation. Using tensor is
+                           crucial when using deep NN and memory replay
         :param scale_observation: whether to scale the observation to have
                                   range [0,1]
         :param scale_low: if scale, set lowerbound on scale range
         :param scale_high: if scale, set upperbound on scale range
         """
         super(MiniGridFlatWrapper, self).__init__(env)
+
+        # Whether to output (1, n) tensor as supposed to flat (n,) vector
+        self.use_tensor = use_tensor
 
         # Set-up whether to scale the observation range and if so how much
         self.scale_observation = scale_observation
@@ -59,6 +66,10 @@ class MiniGridFlatWrapper(gym.core.Wrapper):
         # Determine the range and type of observations
         # TODO optional: scale different dimensions differently, which might
         #      be helpful if I want to include things like directionality
+        # TODO scaling different is super important for the control tasks;
+        #      in that case I might want to set a absolute upper and lower
+        #      bound, and use the env ranges (clipped at absolute bounds)
+        #      as the actual range
         if self.scale_observation:
             obs_low = 0.0
             obs_high = 1.0
@@ -70,7 +81,10 @@ class MiniGridFlatWrapper(gym.core.Wrapper):
             obs_dtype = raw_obs_space.dtype
 
         # Set up observation space shape
-        obs_shape = (np.prod(raw_obs_space.shape),)
+        if self.use_tensor:
+            obs_shape = (1, np.prod(raw_obs_space.shape))
+        else:
+            obs_shape = (np.prod(raw_obs_space.shape),)
 
         # Set up observation space
         new_obs_space = spaces.Box(
@@ -114,6 +128,11 @@ class MiniGridFlatWrapper(gym.core.Wrapper):
             # Scale values to [0,1]
             obs -= self.scale_min
             obs *= (1.0 / (self.scale_max - self.scale_min))
+
+        # ==
+        # Expand to tensor
+        if self.use_tensor:
+            obs = np.expand_dims(obs, axis=0)
 
         return obs
 
