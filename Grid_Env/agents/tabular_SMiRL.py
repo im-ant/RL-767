@@ -137,6 +137,9 @@ class TabularMinSurpriseAgent(object):
                 # Sample next state
                 nex_s = self.rng.choice(self.n_states, p=trans[cur_s, cur_a])
 
+                # TODO: there might be an error with the trans here when the transition or
+                # state density is given?
+
                 # Accumulate reward
                 cur_discount = self.gamma ** traj_t
                 sampled_G[sample_i] += cur_discount * np.log(self.density[nex_s])
