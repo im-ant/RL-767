@@ -108,12 +108,9 @@ class mlp_network(nn.Module):
         return self.fc3(h)
 
 
-class GaussianVae(nn.Module):
+class BernoulliVae(nn.Module):
     """
     Feed-forward VAE
-
-    TODO: should be good, but to be sure I should test the VAE on mnist to see
-          that it is actually learning
     """
 
     # Constructor
@@ -123,7 +120,7 @@ class GaussianVae(nn.Module):
                  latent_dim: int,
                  output_dim: int,
                  device: str = 'cpu'):
-        super(GaussianVae, self).__init__()
+        super(BernoulliVae, self).__init__()
 
         # Attributes
         self.input_d = input_dim
@@ -161,10 +158,8 @@ class GaussianVae(nn.Module):
     # Decoder
     def decode(self, z):
         h = F.relu(self.fc2(z))
-
-        # Previously: for Bernoulli decoder
-        # y = self.sigmoid(self.output(h))
-        y = self.output(h)  # Gaussian decoder, fixed variance
+        y = torch.sigmoid(self.output(h))
+        # y = self.output(h)  # for fixed variance Gaussian decode
 
         return y
 

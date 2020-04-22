@@ -1,10 +1,10 @@
-# ============================================================================
-# Agent set-up for surprising-minimizing agents with flat observations
+# =============================================================================
+# The surprising minizing agent, using Q learning
 #
-# In general, the agent interfaces with the world in either standard python
-# or numpy data types, and cast to torch tensors as needed.
-# ============================================================================
+# Author: Anthony G. Chen
+# =============================================================================
 
+from collections import deque
 from typing import List, Tuple
 
 import numpy as np
@@ -12,19 +12,21 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 
 import network
-from replay_memory import CircularReplayBuffer
+import flat_replay_memory
 
 
 def linearly_decaying_epsilon(decay_period, step, warmup_steps, epsilon_final):
     """
     TODO: organize stuff here and add start epsilon argument
     Code is copied largely directly from the Google Dopamine code
+
     :param decay_period: float, the period over which epsilon is decayed.
     :param step: int, the number of training steps completed so far.
     :param warmup_steps: number of steps taken before epsilon is decayed
-    :param epsilon_final: the final epsilon value
+    :param epsilon: the final epsilon value
     :return: current epsilon value
     """
     steps_left = decay_period + warmup_steps - step
@@ -33,64 +35,122 @@ def linearly_decaying_epsilon(decay_period, step, warmup_steps, epsilon_final):
     return epsilon_final + bonus
 
 
-class FnnQAgent(object):
+class SMiQFlatAgent(object):
     """
-    Q-learning agent with fully connected neural net
+    The DQN Agent
     """
 
-    def __init__(self, n_actions: int,
-                 obs_shape: Tuple,
-                 gamma=0.9,
-                 seed=2,
-                 device='cpu'):
-        # Environment attributes
-        self.n_actions = n_actions
-        self.obs_shape = obs_shape
+    def __init__(self, num_actions: int,
+                 observation_shape: Tuple = (84,),
+                 observation_dtype: torch.dtype = torch.uint8,
+                 history_size: int = 4,
+                 gamma: int = 0.9,
+                 min_replay_history: int = 20000,
+                 update_period: int = 4,
+                 target_update_period: int = 8000,
+                 epsilon_fn=linearly_decaying_epsilon,
+                 epsilon_final: float = 0.1,
+                 epsilon_decay_period: int = 250000,
+                 memory_buffer_capacity: int = 1000000,
+                 q_minibatch_size: int = 32,
+                 vae_minibatch_size: int = 64,
+                 seed: int = 42,
+                 device: str = 'cpu'):
+        """
+        Initialize the Surprise minimizing Q-learning agent
 
-        # MDP related attributes
+        :param num_actions: number of actions the agent can take at any state.
+        :param observation_shape: tuple of ints describing the observation
+                                  shape, expects tuple of (n, )
+        :param observation_dtype: NOTE: type of observaiton
+        :param history_size: int, number of observations to use in state stack.
+        :param gamma: decay constant
+        :param min_replay_history: number of transitions that should be
+            experienced before the agent begins training its value function
+        :param update_period: int, number of actions between network training
+        :param target_update_period: update period of target network (per action)
+        :param epsilon_fn: epsilon decay function
+        :param epsilon_start: exploration rate at start
+        :param epsilon_final: final exploration rate
+        :param epsilon_decay_period: length of the epsilon decay schedule
+        :param memory_buffer_capacity: total capacity of the memory buffer for replay
+        :param device: 'cuda' or 'cpu', depending on if 'cuda' is available
+        :param summary_writer: TODO implement this with TensorBoard in the future
+        """
+
+        # ==
+        # Set attributes
+
+        # Environment related attributes
+        self.num_actions = num_actions
+        self.observation_shape = observation_shape
+        self.observation_dtype = observation_dtype
+        self.history_size = history_size
         self.gamma = gamma
-        self.epsilon_final = 0.01
-        self.decay_period = 10000
-        self.warmup_steps = 10
 
-        # Q network parameters
-        self.q_net_lr = 0.001
-        self.q_minibatch_size = 32
-        self.target_update_steps = 64
+        # Exploration related attributes
+        self.epsilon_fn = epsilon_fn
+        self.epsilon_final = epsilon_final
+        self.epsilon_decay_period = epsilon_decay_period
 
-        # Memory buffer parameters
-        self.buffer_capacity = 1000
+        # Learning related attributes
+        self.min_replay_history = min_replay_history
+        self.update_period = update_period
+        self.target_update_period = target_update_period
+        self.memory_buffer_capacity = memory_buffer_capacity
+        self.q_minibatch_size = q_minibatch_size
+        self.q_lr = 0.00025
 
-        # VAE parameters
+        # Density model related attributes
         self.vae_lr = 1e-3
-        self.vae_minibatch_size = 64
+        self.vae_minibatch_size = vae_minibatch_size
         self.vae_latent_dim = 32
 
-        #
+        # System related attributes
         self.seed = seed
-        self.rng = np.random.RandomState(seed=seed)
         self.device = device
+        self.rng = np.random.RandomState(seed=self.seed)
 
-        # Memory and network initialization
-        self.aS_buffer = None
+        # ==
+        # Initialize network, memory and optimizer
+
+        # Policy, target networks and augmented state memory
         self.policy_net = None
         self.target_net = None
         self.pol_optimizer = None
+        self.aug_s_buffer = None
 
-        # VAE initialization
-        self.ex_buffer = None
+        # Density estimate, and experience buffer
         self.vae = None
         self.vae_optimizer = None
+        self.exp_buffer = None
 
-        self._init()
+        self._init_network()
+        self._init_memory()
+
+        # History queue: for stacking observations (np matrices in cpu)
+        self.history_queue = deque(maxlen=self.history_size)
 
         # ==
-        # Logging variables
-        self.prev_action = None
+        # Per-episode density estimate parameters
+        # We want to track E[Z] and Var(Z) = E[X^2] - E[X]^2
+        # To avoid float cancellation, we use Var(Z-K) = Var(Z), so instead
+        # we track: E[(Z-K)^2], where K is a per-episode shift constant
+        self.z_mu = torch.zeros((1, self.vae_latent_dim),
+                                device=self.device,
+                                requires_grad=False)  # E[Z]
+        self.z_shift_const = torch.zeros((1, self.vae_latent_dim),
+                                         device=self.device,
+                                         requires_grad=False)  # K
+        self.z_sq_shifted = torch.zeros((1, self.vae_latent_dim),
+                                        device=self.device,
+                                        requires_grad=False)  # E[(Z-K)^2]
 
-        self.total_steps = 0
-        self.total_Q_training_steps = 0
-
+        # ==
+        # Counter variables
+        self.total_actions_taken = 0  # for epsilon decay
+        self.total_optim_steps = 0  # for target network updates
+        self._latest_epsilon = 1.0
         self.per_episode_log = {
             't': 0,
             'cumulative_log_prob': 0.0,
@@ -101,146 +161,182 @@ class FnnQAgent(object):
             'total_kld_loss': 0.0
         }
 
-        # Per-episode density model parameters TODO why per-episode?
-        self.z_shift = torch.zeros((1, self.vae_latent_dim),  # for num stabil
-                                   device=self.device,
-                                   requires_grad=False)
-        self.z_mu = torch.zeros((1, self.vae_latent_dim),
-                                device=self.device,
-                                requires_grad=False)
-        self.z_shifted_mu2 = torch.zeros((1, self.vae_latent_dim),
-                                         device=self.device,
-                                         requires_grad=False)
+        self.action = None  # action to be taken (selected at prev timestep)
+        self._prev_observation = None
 
-        # TODO use tensorboard.add_custom_scalars(layout)
-        # https://pytorch.org/docs/stable/tensorboard.html
-        # To add hyperparameters used
+    def _init_network(self) -> None:
+        """Initialize the small flat Q network"""
+        # ==
+        # Initialize Q networks and its optimizer
+        # Mapping from Q: (1, aug_state_dim) -> (1, num_actions)
 
-    def _init(self):
-        """Temporary function to initialize things"""
-        # Augmented state dimension
-        # Observation dimension + 2 * latent state dimension
-        aug_state_shape = ((np.prod(self.obs_shape) + (2 * self.vae_latent_dim)),)
+        # Compute the augmented state dimension, which is the normal state +
+        # the per-episode mean and variance estimates
+        aug_state_dim = (np.prod(self.observation_shape) * self.history_size +
+                         (2 * self.vae_latent_dim))
 
-        # ===
-        # Buffers
-        # Experience buffer of past observations (hacky, since I only need to
-        # store observations but I'm storing s,a,r,s)
-        self.ex_buffer = CircularReplayBuffer(buffer_cap=self.buffer_capacity,
-                                              history=1,
-                                              obs_shape=((1,) + self.obs_shape),
-                                              obs_dtype=torch.float32,
-                                              seed=self.seed * 3,
-                                              device=self.device)
-        # Augmented state buffer for policy training
-        self.aS_buffer = CircularReplayBuffer(buffer_cap=self.buffer_capacity,
-                                              history=1,
-                                              obs_shape=((1,) + aug_state_shape),
-                                              obs_dtype=torch.float32,
-                                              seed=self.seed * 3,
-                                              device=self.device)
-
-        # ===
-        # Policy network
-        # Init policy and target networks
-        # TODO: need to also pass in the sufficient statistic from the density estimation
-        self.policy_net = network.mlp_network(np.prod(aug_state_shape), 24,
-                                              self.n_actions).to(self.device)
-        self.target_net = network.mlp_network(np.prod(aug_state_shape), 24,
-                                              self.n_actions).to(self.device)
+        # Initialize networks
+        self.policy_net = network.mlp_network(
+            input_size=aug_state_dim,
+            hidden_size=32,
+            num_actions=self.num_actions
+        ).to(self.device)
+        self.target_net = network.mlp_network(
+            input_size=aug_state_dim,
+            hidden_size=32,
+            num_actions=self.num_actions
+        ).to(self.device)
 
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()  # set target net to evaluation mode
 
+        # https://pytorch.org/docs/stable/optim.html#torch.optim.RMSprop
+        # TODO change to Adam?
+        self.pol_optimizer = optim.RMSprop(self.policy_net.parameters(),
+                                           lr=self.q_lr,
+                                           alpha=0.95,
+                                           momentum=0.0,
+                                           eps=0.00001,
+                                           centered=True)
+
+        # ==
+        # Initialize the density estimation VAE network
+        # Mapping from V: (1, state_dim) -> (1, state_dim)
+        self.vae = network.BernoulliVae(
+            input_dim=np.prod(self.observation_shape) * self.history_size,
+            hidden_dim=64,
+            latent_dim=self.vae_latent_dim,
+            output_dim=np.prod(self.observation_shape) * self.history_size,
+            device=self.device
+        ).to(self.device)
+
         # Optimizer
-        self.pol_optimizer = optim.Adam(self.policy_net.parameters(),
-                                        lr=self.q_net_lr,
-                                        betas=(0.9, 0.999),  # rest is default
-                                        eps=1e-08, weight_decay=0,
-                                        amsgrad=False)
-
-        # ===
-        # VAE
-        self.vae = network.GaussianVae(input_dim=np.prod(self.obs_shape),
-                                       hidden_dim=64,
-                                       latent_dim=self.vae_latent_dim,
-                                       output_dim=np.prod(self.obs_shape),
-                                       device=self.device,
-                                       ).to(self.device)
-
         self.vae_optimizer = optim.Adam(self.vae.parameters(),
-                                        lr=self.vae_lr,
-                                        betas=(0.9, 0.999),  # rest is default
-                                        eps=1e-08, weight_decay=0,
-                                        amsgrad=False)
+                                        lr=self.vae_lr)
 
-    def begin_episode(self, observation: np.ndarray):
-        # Cast to torch tensor of size (channel, feature 1, *)
-        # Note below is specifically for "flat" observations (e.g. (4,))
-        obs_tensor = np.reshape(observation, (1, len(observation)))  # (1, obs)
-        obs_tensor = torch.tensor(obs_tensor, dtype=torch.float32)
-
-        # Generate augmented states (1, obs + 2*vae_latent_dim)
-        aug_s_tensor = self._generate_aug_state(obs_tensor)
+    def _init_memory(self) -> None:
+        """
+        Initialize memory buffers
+            aug_s_buffer: augmented state buffer for policy
+            exp_buffer: experience buffer for density model
+        """
+        # ==
+        # Augmented state buffer for policy training
+        # will always have history 1 since each entry is a full augmented
+        # state (full history of observation + sufficient statistics of
+        # density model)
+        aug_state_dim = (np.prod(self.observation_shape) * self.history_size +
+                         (2 * self.vae_latent_dim))
+        self.aug_s_buffer = flat_replay_memory.CircularFlatReplayBuffer(
+            buffer_cap=self.memory_buffer_capacity,
+            history=1,
+            obs_shape=(aug_state_dim,),
+            obs_dtype=self.observation_dtype,
+            device=self.device
+        )
 
         # ==
-        # Pick action
-        action = self._select_action(aug_s_tensor)
-        self.prev_action = action
+        # (Normal) experience buffer for density model training
+        self.exp_buffer = flat_replay_memory.CircularFlatReplayBuffer(
+            buffer_cap=self.memory_buffer_capacity,
+            history=self.history_size,
+            obs_shape=self.observation_shape,
+            obs_dtype=self.observation_dtype,
+            device=self.device
+        )
+
+    def begin_episode(self, observation: np.ndarray) -> int:
+        """
+        Start the episode
+        :param observation: first observation, with env.observation_space.shape
+        :return: first action (idx) to be taken
+        """
+        # ==
+        # Initialize (zero-padded) history
+        # NOTE: each entry in queue is a (self.observation_shape) tensor
+        for _ in range(self.history_size):
+            zero_pad_mat = torch.zeros(self.observation_shape,
+                                       dtype=self.observation_dtype,
+                                       device='cpu')
+            self.history_queue.append(zero_pad_mat)
+        # Add the first observation to the history
+        obs_tensor = torch.tensor(observation,
+                                  dtype=self.observation_dtype,
+                                  device='cpu')
+        self.history_queue.append(obs_tensor)
 
         # ==
-        # Reset variables
+        # Construct augmented state and pick action
+        state_tensor = self._history_queue_to_state()  # (1, feature * history)
+        aug_state_tensor = self._generate_aug_state(state_tensor)
+        action = self._select_action(aug_state_tensor)
+
+        # ==
+        # Update density estimate
+        with torch.no_grad():
+            init_z, init_z_var = self.vae.encode(state_tensor)
+        self.z_mu = init_z.clone()
+        self.z_shift_const = init_z.clone()
+        self.z_sq_shifted *= 0.0  # E[(Z-K)^2] = 0 with initial observation
+
+        # ==
+        # Reset per-episode counters
         for k in self.per_episode_log:
             self.per_episode_log[k] *= 0
 
         # ==
-        # Initialize variables for mu and variance estimation
-        obs_tensor = obs_tensor.to(self.device)
-        with torch.no_grad():
-            obs_z, obs_z_var = self.vae.encode(obs_tensor)
-        self.z_shift = obs_z.clone()
-        self.z_mu = obs_z.clone()
-        self.z_shifted_mu2 *= 0.0  # shifted to zero
-
-        return action
+        # Return action
+        self.action = action
+        self._prev_observation = observation
+        self.total_actions_taken += 1
+        # TODO potential bug above that might skip some training steps?
+        return self.action
 
     def step(self, observation: np.ndarray, reward: float, done: bool) -> int:
         """
-        Observe the environment and take an action
+        The agent takes one step
 
-        :param observation:
-        :param reward:
-        :param done:
-        :return: int indexing the action to be taken
+        :param observation: o_t, observation from environment, should
+                            have shape self.observation_shape
+        :param reward: r_t, float reward received
+        :param done: done_t, bool, whether the episode is finished
+        :return: int denoting action to take at this step
         """
+
         # ==
-        # Type cast the input and store to experience memory
+        # Store observation to history queue
+        cur_obs_tensor = torch.tensor(observation,
+                                      dtype=self.observation_dtype,
+                                      device='cpu')
+        self.history_queue.append(cur_obs_tensor)
 
-        # Cast to torch tensor of size (channel, feature 1, *)
-        # Note below is specifically for "flat" observations (e.g. (4,))
-        obs_tensor = np.reshape(observation, (1, len(observation)))
-        obs_tensor = torch.tensor(obs_tensor, dtype=torch.float32).clone()
-
-        # Cast reward and action
-        act_tensor = torch.tensor(self.prev_action)
-        rew_tensor = torch.tensor(reward).clone()
-        don_tensor = torch.tensor(done).clone()
-
-        # Store to experience buffer
-        self.ex_buffer.push(obs_tensor, act_tensor, rew_tensor, don_tensor)
+        # ==
+        # Store experience: o_{t-1}, a_{t-1}, r_t, done_t
+        # First set them to the correct tensor, dtype and device
+        obs_tensor = torch.tensor(self._prev_observation,
+                                  dtype=self.observation_dtype,
+                                  device=self.device)
+        act_tensor = torch.tensor([self.action], dtype=torch.int32,
+                                  device=self.device)
+        rew_tensor = torch.tensor([reward], dtype=torch.float32,
+                                  device=self.device)
+        don_tensor = torch.tensor([done], dtype=torch.bool,
+                                  device=self.device)
+        self.exp_buffer.push(obs_tensor, act_tensor, rew_tensor, don_tensor)
 
         # ==
         # Store augmented state
-        # Encode to latent space
-        obs_tensor = obs_tensor.to(self.device)
+        # Construct state and encode latent state
+        state_tensor = self._history_queue_to_state()  # (1, feature * history)
         with torch.no_grad():
-            obs_z, obs_z_var = self.vae.encode(obs_tensor)
-        # Generate augmented state and rewards
-        aug_s_tensor = self._generate_aug_state(obs_tensor)
-        aug_r_tensor = self._generate_aug_reward(obs_z)
+            z_tensor, z_var = self.vae.encode(state_tensor)
 
-        # Store to augmented state buffer
-        self.aS_buffer.push(aug_s_tensor, act_tensor, aug_r_tensor, don_tensor)
+        # Generate augmented state (1, feature*history+2*latent) and rewards
+        aug_s_tensor = self._generate_aug_state(state_tensor)
+        aug_r_tensor = self._generate_aug_reward(z_tensor)  # (1, )
+
+        self.aug_s_buffer.push(aug_s_tensor, act_tensor, aug_r_tensor,
+                               don_tensor)
 
         # ==
         # Training step
@@ -249,39 +345,60 @@ class FnnQAgent(object):
         # ==
         # Select action
         action = self._select_action(aug_s_tensor)
-        self.prev_action = action
 
         # ==
-        # Update estimate
-        self.per_episode_log['t'] += 1
-        t = self.per_episode_log['t']
-        self.z_mu += (1 / (t + 1)) * (obs_z - self.z_mu)
-        self.z_shifted_mu2 += ((1 / (t + 1)) *
-                               ((obs_z - self.z_shift).pow(2) -
-                                self.z_shifted_mu2))
+        # Update density estimates using running average
+        t = self.per_episode_log['t'] + 1
+        self.z_mu += (1 / (t + 1)) * (z_tensor - self.z_mu)  # E[Z]
+        self.z_sq_shifted += ((1 / (t + 1)) *
+                              ((z_tensor - self.z_shift_const).pow(2)
+                               - self.z_sq_shifted))  # E[(Z-K)^2]
 
-        # Track reward estimate
+        # ==
+        # Update counters and return
+        self.action = action
+        self._prev_observation = observation
+        self.total_actions_taken += 1
+        self.per_episode_log['t'] += 1
         self.per_episode_log['cumulative_log_prob'] += aug_r_tensor.item()
 
-        return action
+        return self.action
 
-    def _generate_aug_state(self, obs_tensor):
+    def _history_queue_to_state(self) -> torch.tensor:
+        """
+        Convert the current history queue into a torch tensor state, where the
+        state is sent to device (same as the neural nets).
+
+        Each entry in the self.history_queue is a (self.observation_shape)
+        tensor, which is concatenated at the first dimension, with an
+        additional dimension added at the 0-oth position
+
+        :return: torch.tensor object of state, of shape (1, feature * history)
+        """
+        state = torch.cat(list(self.history_queue), dim=0).unsqueeze(0)
+        state = state.type(torch.float32).to(self.device)
+        return state
+
+    def _generate_aug_state(self, state_tensor):
         """
         Generate the "augmented state" for policy training, augmented state
-        include the observation and the sufficient statistics of the current
+        include the state and the sufficient statistics of the current
         density model (so it is fully observable for the policy to learn to
         maximize prob. of the current density model)
 
-        :param obs_tensor: torch tensor of shape (1, feature)
-        :return: augmented state tensor of shape (1, feature + 2*vae_latent_dim)
+        :param state_tensor: torch tensor of shape (1, feature*history)
+        :return: augmented state tensor of shape
+                 (1, feature*history + 2*vae_latent_dim)
         """
-        # Compute the variance
-        z_var = ((self.z_shifted_mu2 - (self.z_mu - self.z_shift).pow(2))
-                 + 1e-10)
+        # Compute the variance: Var(Z) = E[(Z-K)^2] - (E[Z]-K)^2
+        z_var = ((self.z_sq_shifted
+                  - (self.z_mu - self.z_shift_const).pow(2))
+                 + 1e-10)  # stability
 
-        obs_tensor = obs_tensor.to(self.device)
-        aug_s = torch.cat((obs_tensor, self.z_mu, z_var), dim=1)
-        return aug_s
+        # Move state to device and concatenate with sufficient statistics
+        state_tensor = state_tensor.to(self.device)
+        aug_state = torch.cat((state_tensor, self.z_mu, z_var), dim=1)
+        return aug_state
 
     def _generate_aug_reward(self, z_tensor):
         """
@@ -291,9 +408,10 @@ class FnnQAgent(object):
         :param obs_tensor: torch tensor of shape (1, feature)
         :return: "reward" tensor of shape (1,)
         """
-        # Compute the variance
-        z_var = ((self.z_shifted_mu2 - (self.z_mu - self.z_shift).pow(2))
-                 + 1e-10)
+        # Compute the variance: Var(Z) = E[(Z-K)^2] - (E[Z]-K)^2
+        z_var = ((self.z_sq_shifted
+                  - (self.z_mu - self.z_shift_const).pow(2))
+                 + 1e-10)  # stability
 
         # Generate augmented reward
         aug_r = - torch.sum((
@@ -304,132 +422,79 @@ class FnnQAgent(object):
 
         return aug_r
 
+    def _select_action(self, state) -> int:
+        """
+        Select action according to the epsilon greedy policy
+        :param state: the AUGMENTED state
+        :return: int action index
+        """
+
+        # Compute epsilon
+        epsilon = self.epsilon_fn(self.epsilon_decay_period,
+                                  self.total_actions_taken,
+                                  self.min_replay_history,
+                                  self.epsilon_final)
+        self._latest_epsilon = epsilon
+
+        # ===
+        # Epsilon greedy policy
+        if self.rng.uniform() <= epsilon:
+            # random action with probability epsilon
+            return self.rng.choice(self.num_actions)
+        else:
+            # greedy action
+            with torch.no_grad():
+                # Get values (1, n_actions), then take max column index
+                action_tensor = self.policy_net(state).max(1)[1].view(1, 1)
+            return action_tensor.item()
+
     def _train_step(self) -> None:
         """
-        Take one step training, evaluate whether or not to optimize model
-        depending on memory buffer size, and whether to update the
-        parameters of the target network
-        :return: None
+        Run a singe training step. Train both the policy network and the
+        density estimate. Occasionally update the target network
         """
 
         # ==
-        # Optimize the policy network Q estimates
-        if len(self.aS_buffer) >= self.q_minibatch_size:
-            self._optimize_policy()
-
-            # Update target network with policy network
-            if self.total_Q_training_steps % self.target_update_steps == 0:
+        # Optimize the policy network and Q estimates
+        if len(self.aug_s_buffer) > self.min_replay_history:
+            # Update policy network
+            if self.total_actions_taken % self.update_period == 0:
+                if len(self.aug_s_buffer) >= self.q_minibatch_size:
+                    self._optimize_policy()
+            # Update target network
+            if self.total_optim_steps % self.target_update_period == 0:
                 self.target_net.load_state_dict(self.policy_net.state_dict())
 
-            self.total_Q_training_steps += 1
-
         # ==
-        # Optimize the density model
-        if len(self.ex_buffer) >= self.vae_minibatch_size:
+        # Optimize the density estimate
+        if len(self.exp_buffer) >= self.vae_minibatch_size:
             self._optimize_density()
 
-        # ==
-        # Increment counter
-        self.total_steps += 1
-
-    def _sample_format_memory(self, batch_size, buffer) -> Tuple:
+    def _optimize_policy(self) -> float:
         """
-        Helper function to sample the memory buffer, format the minibatch of
-        sampled data in the right type, shape and device, and return
-
-        :return: Tuple containing:
-            state_batch: (batch size, feature dim)
-            action_batch: (batch size, )    TODO confirm this
-            reward_batch: (batch size, 1)
-            next_state_batch: (batch size, feature dim)
-            done_batch: (batch size, 1)
+        Optimizes the policy (Q) network
         """
         # ==
-        # Sample memory and unpack to the right shapes
-        mem_batch = buffer.sample(batch_size)
-        state_batch, action_batch, reward_batch, \
-        next_state_batch, done_batch = mem_batch
+        # Sample augmented states and unpack
+        mem_batch = self.aug_s_buffer.sample(self.q_minibatch_size)
+        (state_batch, action_batch, reward_batch,
+         next_state_batch, done_batch) = mem_batch
 
-        state_batch = state_batch.type(torch.float32) \
-            .view((batch_size, -1)).to(self.device)  # (batch, feat)
-
+        state_batch = state_batch.type(torch.float32).to(self.device)
         action_batch = action_batch.type(torch.long).to(self.device)
-
-        reward_batch = reward_batch.type(torch.float32) \
-            .view((batch_size, -1)).to(self.device)
-
-        next_state_batch = next_state_batch.type(torch.float) \
-            .view((batch_size, -1)).to(self.device)  # (batch, feat)
-
-        done_batch = done_batch.view((batch_size, -1)) \
-            .to(self.device)  # (batch, 1)
-
-        out_tup = (state_batch, action_batch, reward_batch,
-                   next_state_batch, done_batch)
-
-        return out_tup
-
-    def _optimize_density(self) -> None:
-        """
-        Optimize the density estimation
-        :return:
-        """
+        reward_batch = reward_batch.type(torch.float32).to(self.device)
+        next_state_batch = next_state_batch.type(torch.float32).to(self.device)
+        done_batch = done_batch.type(torch.bool).to(self.device)
 
         # ==
-        # Sample
-        mem_batch = self._sample_format_memory(self.vae_minibatch_size,
-                                               self.ex_buffer)
-        (state_batch, action_batch, reward_batch,
-         next_state_batch, done_batch) = mem_batch
+        # Compute TD error
 
-        # ==
-        # VAE training
-        mu, log_var = self.vae.encode(state_batch)
-        z_vec = self.vae.sample_z(mu, log_var)
-        recon_batch = self.vae.decode(z_vec)
-
-        # Loss
-        # Note: binary decoder has BCE loss, here we use Gaussian + fix var
-        dec_loss = F.mse_loss(recon_batch, state_batch, reduction='mean')
-        # dec_loss = F.binary_cross_entropy(recon_batch, state_batch,
-        #                                   reduction='mean')  # TODO remove BCE loss
-        kld = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
-        vae_loss = dec_loss + kld
-
-        # Gradient update
-        vae_loss.backward()
-        self.vae_optimizer.step()
-
-        # ==
-        # Logging loss
-        self.per_episode_log['total_dec_loss'] += dec_loss.item()
-        self.per_episode_log['total_kld_loss'] += kld.item()
-        self.per_episode_log['vae_optim_steps'] += 1
-
-    def _optimize_policy(self) -> None:
-        """
-        Optimizes the policy net model
-        :return:
-        """
-
-        # ==
-        # Sample
-        mem_batch = self._sample_format_memory(self.q_minibatch_size,
-                                               self.aS_buffer)
-        (state_batch, action_batch, reward_batch,
-         next_state_batch, done_batch) = mem_batch
-
-        # ==
-        # Compute target (current & expected values)
-
-        # Get policy net output (batch, n_actions), extract with action index
-        # which needs to have shape (batch, 1) for torch.gather to work.
-        # this gets us the value of action taken
+        # Get policy net output (batch, n_actions), extract action (index)
+        # which need to have shape (batch, 1) for torch.gather to work.
         state_action_values = self.policy_net(state_batch) \
-            .gather(1, action_batch.view(-1, 1))  # (batch-size, 1)
+            .gather(1, action_batch)  # (batch-size, 1)
 
-        # Get semi-gradient Q-learning targets
-        # (Note the next state value is detached from compute graph)
+        # Get semi-gradient Q-learning targets (no grad to next state)
         next_state_values = self.target_net(next_state_batch) \
             .max(1)[0].unsqueeze(1).detach()  # (batch-size, 1)
         # Note that if episode is done do not use bootstrap estimate
@@ -437,8 +502,8 @@ class FnnQAgent(object):
                                          * self.gamma)
                                         + reward_batch)
 
-        # Compute TD loss (DQN uses smooth_l1_loss I believe)
-        loss = F.mse_loss(state_action_values, expected_state_action_values)
+        # Compute TD loss
+        loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
 
         # ==
         # Optimization
@@ -448,46 +513,60 @@ class FnnQAgent(object):
             param.grad.data.clamp_(-1, 1)
         self.pol_optimizer.step()
 
-        # ==
-        # Logging the loss
+        # Log the loss
         self.per_episode_log['total_Q_loss'] += loss.item()
         self.per_episode_log['Q_optim_steps'] += 1
+        self.total_optim_steps += 1
 
-    def _select_action(self, s_tensor: torch.Tensor):
+    def _optimize_density(self):
         """
-        Epsilon-greedy policy
-
-        :param s_tensor: torch tensor of size (channel, feature 1, *)
-        :return:
+        Optimize the density estimate
         """
+        # ==
+        # Sample experience to get states and unpack
+        mem_batch = self.exp_buffer.sample(self.vae_minibatch_size)
+        (state_batch, action_batch, reward_batch,
+         next_state_batch, done_batch) = mem_batch
 
-        eps = linearly_decaying_epsilon(decay_period=self.decay_period,
-                                        step=self.total_steps,
-                                        warmup_steps=self.warmup_steps,
-                                        epsilon_final=self.epsilon_final)
-
-        # Ensure input has size (1, feature) for MLP
-        s_tensor = s_tensor.clone().detach().view(1, -1).to(self.device)
+        state_batch = state_batch.type(torch.float32).to(self.device)
 
         # ==
-        if self.rng.uniform() <= eps:
-            return self.rng.choice(self.n_actions)
-        else:
-            with torch.no_grad():
-                # Get values (1, n_actions), then take max column index
-                action = self.policy_net(s_tensor).max(1)[1] \
-                    .view(1).item()
-                return action
+        # VAE training
+        mu, log_var = self.vae.encode(state_batch)
+        z_vec = self.vae.sample_z(mu, log_var)
+        recon_batch = self.vae.decode(z_vec)
 
-    def report(self, logger=None, epis_idx=None):
+        # Loss
+        dec_loss = F.binary_cross_entropy(recon_batch, state_batch,
+                                          reduction='mean')
+        kld = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+        vae_loss = dec_loss + kld
+
+        # Optimization
+        self.vae_optimizer.zero_grad()
+        vae_loss.backward()
+        self.vae_optimizer.step()
+
         # ==
-        # Compute averages
+        # Logging
+        self.per_episode_log['total_dec_loss'] += dec_loss.item()
+        self.per_episode_log['total_kld_loss'] += kld.item()
+        self.per_episode_log['vae_optim_steps'] += 1
 
-        # Per episode Q-learning logs
-        avg_policy_loss = 0.0
+    def report(self, episode_idx, logger=None):
+        # ==
+        # Compute the averages
+
+        # Per-episode average log probability
+        avg_log_prob = (self.per_episode_log['cumulative_log_prob'] /
+                        self.per_episode_log['t'])
+
+
+        # Per-episode policy optimization loss
+        avg_Q_loss = 0.0
         if self.per_episode_log['Q_optim_steps'] > 0:
-            avg_policy_loss = (self.per_episode_log['total_Q_loss'] /
-                               self.per_episode_log['Q_optim_steps'])
+            avg_Q_loss = (self.per_episode_log['total_Q_loss'] /
+                          self.per_episode_log['Q_optim_steps'])
 
         # Per episode VAE logs
         avg_dec_loss = 0.0
@@ -498,69 +577,51 @@ class FnnQAgent(object):
             avg_kld_loss = (self.per_episode_log['total_kld_loss'] /
                             self.per_episode_log['vae_optim_steps'])
 
-        # Epsilon exploration rate
-        eps = linearly_decaying_epsilon(decay_period=self.decay_period,
-                                        step=self.total_steps,
-                                        warmup_steps=self.warmup_steps,
-                                        epsilon_final=self.epsilon_final)
 
         # ==
         # Print or log
+        if episode_idx == 0:
+            print("\tEpsilon || total_actions || total_optims || avg_Q_loss")
+
         if logger is None:
-            print(f'Total steps: {self.total_steps}, '
-                  f'Total Q training steps: {self.total_Q_training_steps}')
-            print(f"\tEpis_cumu_log_prob: {self.per_episode_log['cumulative_log_prob']}\n"
-                  f"\tEpis_Q_optim_steps: {self.per_episode_log['Q_optim_steps']}\n"
-                  f"\tEpis_avg_Q_loss: {avg_policy_loss}\n"
-                  f"\tEpis_vae_optim_steps_loss: {self.per_episode_log['vae_optim_steps']}\n"
-                  f"\tEpis_avg_dec_loss: {avg_dec_loss}\n"
-                  f"\tEpis_avg_kld_loss: {avg_kld_loss}\n")
-
+            print(f"  {self._latest_epsilon} || "
+                  f"{self.total_actions_taken} || "
+                  f"{self.total_optim_steps} || "
+                  f"{avg_Q_loss}")
         else:
-            # Total steps and policy training steps
-            logger.add_scalar('Total_steps', self.total_steps,
-                              global_step=epis_idx)
-            logger.add_scalar('Total_Q_training_steps', self.total_Q_training_steps,
-                              global_step=epis_idx)
+            logger.add_scalar('Timesteps', self.per_episode_log['t'],
+                              global_step=episode_idx)
 
-            logger.add_scalar('Eps_exploration', eps,
-                              global_step=epis_idx)
+            logger.add_scalar('Eps_exploration', self._latest_epsilon,
+                              global_step=episode_idx)
+            logger.add_scalar('Total_actions', self.total_actions_taken,
+                              global_step=episode_idx)
+            logger.add_scalar('Total_pol_optimizations', self.total_optim_steps,
+                              global_step=episode_idx)
 
+            logger.add_scalar('Per_episode_avg_Q_loss', avg_Q_loss,
+                              global_step=episode_idx)
             logger.add_scalar('Per_episode_cumulative_log_prob',
                               self.per_episode_log['cumulative_log_prob'],
-                              global_step=epis_idx)
-
-            logger.add_scalar('Per_episode_Q_optim_steps',
-                              self.per_episode_log['Q_optim_steps'],
-                              global_step=epis_idx)
-            logger.add_scalar('Per_episode_avg_Q_loss', avg_policy_loss,
-                              global_step=epis_idx)
+                              global_step=episode_idx)
+            logger.add_scalar('Per_episode_avg_log_prob',
+                              avg_log_prob,
+                              global_step=episode_idx)
 
             logger.add_scalar('Per_episode_vae_optim_steps',
                               self.per_episode_log['vae_optim_steps'],
-                              global_step=epis_idx)
+                              global_step=episode_idx)
             logger.add_scalar('Per_episode_avg_dec', avg_dec_loss,
-                              global_step=epis_idx)
+                              global_step=episode_idx)
             logger.add_scalar('Per_episode_avg_kld', avg_kld_loss,
-                              global_step=epis_idx)
+                              global_step=episode_idx)
 
 
 if __name__ == "__main__":
-    agent = FnnQAgent(n_actions=3,
-                      obs_shape=(4,), )
-
-    print(agent.buffer)
+    # for testing run this directly
+    print('testing')
+    agent = DQNAgent(num_actions=8)
+    print(agent)
     print(agent.policy_net)
     print(agent.target_net)
-    print()
-
-    obs = np.array([0.0, 0.1, 0.2, 0.3])
-    reward = 1.0
-    done = False
-
-    agent.begin_episode(obs)
-    for i in range(30):
-        action = agent.step(obs, reward, done)
-        print(f'epis{i}, action: {action}')
-        if agent.cur_epis_optim_steps > 0:
-            print(agent.cur_epis_optim_steps, agent.cur_epis_policy_loss / agent.cur_epis_optim_steps)
+    print(agent.memory.capacity)

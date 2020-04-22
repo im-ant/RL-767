@@ -8,14 +8,14 @@
 import argparse
 
 import gym
-import numpy as np
-
 from gym_minigrid import wrappers
+import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from flat_wrapper import MiniGridFlatWrapper
 import dqn_flat_agent
+import smi_flat_agent
 
 
 # ========================================
@@ -24,7 +24,7 @@ import dqn_flat_agent
 
 def init_agent(args, env, device='cpu'):
 
-    if args.agent_type is 'dqn_flat':
+    if args.agent_type == 'dqn_flat':
         agent = dqn_flat_agent.DQNFlatAgent(
             num_actions=env.action_space.n,
             observation_shape=env.observation_space.shape,
@@ -37,13 +37,28 @@ def init_agent(args, env, device='cpu'):
             epsilon_final=args.final_exploration,
             epsilon_decay_period=args.eps_decay_duration,
             memory_buffer_capacity=args.buffer_capacity,
-            minibatch_size=args.q_batch_size,
+            q_minibatch_size=args.q_batch_size,
             seed=args.seed,
             device=device,
         )
-    elif args.agent_type is 'smirl_dqn_flat':
-        # TODO add the smirl agent here
-        agent = None
+    elif args.agent_type == 'smirl_dqn_flat':
+        agent = smi_flat_agent.SMiQFlatAgent(
+            num_actions=env.action_space.n,
+            observation_shape=env.observation_space.shape,
+            observation_dtype=torch.float32,
+            history_size=args.history_size,
+            gamma=args.discount_factor,
+            min_replay_history = args.min_replay_history,
+            update_period=args.update_period,
+            target_update_period=args.target_update_frequency,
+            epsilon_final=args.final_exploration,
+            epsilon_decay_period=args.eps_decay_duration,
+            memory_buffer_capacity=args.buffer_capacity,
+            q_minibatch_size=args.q_batch_size,
+            vae_minibatch_size=args.vae_batch_size,
+            seed=args.seed,
+            device=device
+        )
     else:
         agent = None
 
@@ -118,7 +133,7 @@ def run_environment(args: argparse.Namespace,
                 if args.log_dir is not None:
                     logger.add_scalar('Reward', cumu_reward,
                                       global_step=episode_idx)
-                    if epis_idx % 10 == 0:
+                    if episode_idx % 10 == 0:
                         print(f'Epis {episode_idx}, Timesteps: {timestep}, Return: {cumu_reward}')
 
                 else:
@@ -162,10 +177,10 @@ if __name__ == "__main__":
                         help='initial e-greedy exploration value (default: 1.0)')
     parser.add_argument('--final_exploration', type=float, default=0.05, metavar='N',
                         help='final e-greedy exploration value (default: 0.05)')
-    parser.add_argument('--eps_decay_duration', type=int, default=100000, metavar='N',
+    parser.add_argument('--eps_decay_duration', type=int, default=50000, metavar='N',
                         help='number of actions over which the initial '
                              'exploration rate is linearly annealed to the '
-                             'final exploration rate (default: 100,000)')
+                             'final exploration rate (default: 50,000)')
 
     parser.add_argument('--min_replay_history', type=int, default=1024, metavar='N',
                         help='number of actions taken (transition stored) '
@@ -206,7 +221,7 @@ if __name__ == "__main__":
         # Tensorboard logger
         logger = SummaryWriter(log_dir=args.log_dir)
         # Add hyperparameters
-        # TODO this will throw an exception for "none" hyperparmeters
+        # TODO this will throw an exception for "None" hyperparmeters
         logger.add_hparams(hparam_dict=vars(args), metric_dict={})
     else:
         logger = None
