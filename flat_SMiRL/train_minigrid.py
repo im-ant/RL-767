@@ -133,7 +133,7 @@ def run_environment(args: argparse.Namespace,
                 if args.log_dir is not None:
                     logger.add_scalar('Reward', cumu_reward,
                                       global_step=episode_idx)
-                    if episode_idx % 10 == 0:
+                    if episode_idx % 100 == 0:
                         print(f'Epis {episode_idx}, Timesteps: {timestep}, Return: {cumu_reward}')
 
                 else:
