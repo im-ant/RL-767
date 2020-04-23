@@ -6,6 +6,8 @@
 # ============================================================================
 
 import argparse
+import csv
+import os
 
 import gym
 from gym_minigrid import wrappers
@@ -61,29 +63,6 @@ def init_agent(args, env, device='cpu'):
         )
     else:
         agent = None
-
-
-    """
-    TODO delete, below for reference only
-    if AGENT is 'linear':
-        agent = classic_agent.LinearQAgent(n_actions=env.action_space.n,
-                                           obs_shape=env.observation_space.shape,
-                                           gamma=0.9,
-                                           epsilon=0.1,
-                                           lr=0.001)
-    if AGENT is 'smi_fc':
-        agent = smi_flat_agent.FnnQAgent(n_actions=env.action_space.n,
-                                         obs_shape=env.observation_space.shape,
-                                         gamma=0.95,
-                                         seed=args.seed,
-                                         device=DEVICE)
-    else:
-        agent = classic_agent.FnnQAgent(n_actions=env.action_space.n,
-                                        obs_shape=env.observation_space.shape,
-                                        gamma=0.95,
-                                        seed=args.seed,
-                                        device=DEVICE)
-    """
 
     return agent
 
@@ -220,9 +199,24 @@ if __name__ == "__main__":
     if args.log_dir is not None:
         # Tensorboard logger
         logger = SummaryWriter(log_dir=args.log_dir)
+
         # Add hyperparameters
         # TODO this will throw an exception for "None" hyperparmeters
-        logger.add_hparams(hparam_dict=vars(args), metric_dict={})
+        # NOTE: not using add_hparams due to difficulty in extracting it later
+        # logger.add_hparams(hparam_dict=vars(args), metric_dict={})
+
+        # Write the training parameters to csv
+        hparam_csv_path = os.path.join(args.log_dir, 'training_hparam.csv')
+        with open(hparam_csv_path, 'w') as csvfile:
+            csv_writer = csv.writer(csvfile, delimiter=',')
+
+            hparam_dict = dict(vars(args))
+            for k in hparam_dict:
+                str_v = str(hparam_dict[k])
+
+                # Write to csv
+                csv_writer.writerow([k, str_v])
+
     else:
         logger = None
 
