@@ -15,9 +15,9 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from flat_wrapper import MiniGridFlatWrapper
-import dqn_flat_agent
-import smi_flat_agent
+from envs.flat_wrapper import MiniGridFlatWrapper
+import agents.dqn_flat_agent as dqn_flat_agent
+import agents.smi_flat_agent as smi_flat_agent
 
 
 # ========================================
@@ -99,19 +99,55 @@ def run_environment(args: argparse.Namespace,
         cumu_reward = 0.0
         timestep = 0
 
+        # (optional) Record video
+        video = None
+        max_vid_len = 200
+        if args.video_freq is not None:
+            if episode_idx % args.video_freq == 0:
+                # Render first frame and insert to video array
+                frame = env.render()
+                video = np.zeros(shape=((max_vid_len,) + frame.shape),
+                                 dtype=np.uint8)  # (max_vid_len, C, W, H)
+                video[0] = frame
+
         while True:
-            # Iteract
+            # ==
+            # Interact with environment
             observation, reward, done, info = env.step(action)
             action = agent.step(observation, reward, done)
 
+            # ==
+            # Counters
             cumu_reward += reward
             timestep += 1
 
+            # ==
+            # Optional video
+            if video is not None:
+                if timestep < max_vid_len:
+                    video[timestep] = env.render()
+
+            # ==
+            # Episode done
             if done:
                 # Logging
                 if args.log_dir is not None:
+                    # Add reward
                     logger.add_scalar('Reward', cumu_reward,
                                       global_step=episode_idx)
+                    # Optionally add video
+                    if video is not None:
+                        # Change to tensor
+                        vid_tensor = torch.tensor(video[:timestep+1, :, :],
+                                                  dtype=torch.uint8)
+                        vid_tensor = vid_tensor.unsqueeze(0)
+
+                        # Add to tensorboard
+                        logger.add_video('Run', vid_tensor,
+                                         global_step=episode_idx,
+                                         fps=8)
+
+                    # Occasional print
                     if episode_idx % 100 == 0:
                         print(f'Epis {episode_idx}, Timesteps: {timestep}, Return: {cumu_reward}')
 
@@ -182,6 +218,9 @@ if __name__ == "__main__":
 
     parser.add_argument('--log_dir', type=str, default=None, metavar='',
                         help='Path to the log output directory (default: None)')
+    parser.add_argument('--video_freq', type=int, default=None, metavar='',
+                        help='Freq (in # episodes) to record video, only works'
+                             'if log_dir is also provided (default: None)')
     parser.add_argument('--seed', type=int, default=0, metavar='N',
                         help='Seed for rng (default: 0)')
 
