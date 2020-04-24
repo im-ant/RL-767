@@ -70,6 +70,10 @@ def extract_single_tfEvent(tfevent_path):
                 metric_name = rec_obj.tag
                 metric_val = rec_obj.simple_value
 
+                # NOTE maybe TODO: unsure what happens if metriv_val is
+                # supposedly a saved video (i.e. 4-D tensor), but seems to be
+                # ok so far?
+
                 # Save
                 epis_list.append(episode_idx)
                 metric_list.append(metric_name)
@@ -106,23 +110,28 @@ def run2df(dir_path, hparams):
     # ===
     # Find hyperparameter file, assuming there is only one (or None?)
     hparam_files = glob.glob(f'{dir_path}/*csv')
-    hparam_path = hparam_files[0]
+    if len(hparam_files) > 0:
+        hparam_path = hparam_files[0]
+    else:
+        hparam_path = None
 
     # ===
     # Extract
-    hparam_dict = extract_single_hparamCSV(hparam_path)
+    if hparam_path is not None:
+        hparam_dict = extract_single_hparamCSV(hparam_path)
     metric_dict = extract_single_tfEvent(tfEvent_path)
 
     # ===
     # Combine the metric with wanted hyparameter values
     copy_number = len(metric_dict['episode'])
 
-    for hparam_name in hparams:
-        if hparam_name in hparam_dict:
-            hparam_val = hparam_dict[hparam_name]
-            hparam_list = [hparam_val] * copy_number
+    if hparam_path is not None:
+        for hparam_name in hparams:
+            if hparam_name in hparam_dict:
+                hparam_val = hparam_dict[hparam_name]
+                hparam_list = [hparam_val] * copy_number
 
-            metric_dict[hparam_name] = hparam_list
+                metric_dict[hparam_name] = hparam_list
 
     # Add the "run name", assuming it is the directory name
     run_name = dir_path.split('/')[-1]
