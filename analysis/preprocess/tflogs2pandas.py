@@ -65,6 +65,7 @@ def extract_single_tfEvent(tfevent_path):
         # Get the name and value which was stored
         if hasattr(event.summary, 'value'):
             rec_container = event.summary.value
+
             if len(rec_container) > 0:
                 rec_obj = rec_container.pop()
                 metric_name = rec_obj.tag
@@ -78,6 +79,7 @@ def extract_single_tfEvent(tfevent_path):
                 epis_list.append(episode_idx)
                 metric_list.append(metric_name)
                 val_list.append(metric_val)
+
 
     # Creat metric dictionary
     metric_dict = {
