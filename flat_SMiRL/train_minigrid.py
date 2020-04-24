@@ -103,7 +103,7 @@ def run_environment(args: argparse.Namespace,
         video = None
         max_vid_len = 200
         if args.video_freq is not None:
-            if episode_idx % args.video_freq == 0:
+            if episode_idx % int(args.video_freq) == 0:
                 # Render first frame and insert to video array
                 frame = env.render()
                 video = np.zeros(shape=((max_vid_len,) + frame.shape),
@@ -137,13 +137,18 @@ def run_environment(args: argparse.Namespace,
                                       global_step=episode_idx)
                     # Optionally add video
                     if video is not None:
+                        # Determine last frame
+                        last_frame_idx = timestep+2
+                        if last_frame_idx > max_vid_len:
+                            last_frame_idx = max_vid_len
+
                         # Change to tensor
-                        vid_tensor = torch.tensor(video[:timestep+1, :, :],
+                        vid_tensor = torch.tensor(video[:last_frame_idx, :, :, :],
                                                   dtype=torch.uint8)
                         vid_tensor = vid_tensor.unsqueeze(0)
 
                         # Add to tensorboard
-                        logger.add_video('Run', vid_tensor,
+                        logger.add_video('Run_Video', vid_tensor,
                                          global_step=episode_idx,
                                          fps=8)
 
