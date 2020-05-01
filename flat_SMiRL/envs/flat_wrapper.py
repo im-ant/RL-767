@@ -144,6 +144,7 @@ class MiniGridFlatWrapper(gym.core.Wrapper):
         """
         obs = self.env.reset(**kwargs)
         obs = self._transform_observation(obs)
+
         return obs
 
     def step(self, action):
@@ -158,6 +159,25 @@ class MiniGridFlatWrapper(gym.core.Wrapper):
         # maybe TODO: had a note from previous: should I do reward clipping?
 
         return obs, reward, done, info
+
+    def render(self, tile_size=8):
+        """
+        Provide rbg rendering of the environment
+        :param tile_size: number of pixel to use to render a single tile
+        :return: np.ndarray of the current rgb image frame, of shape
+                 (channel, height, width), or
+                 (3, tiles*tile_size, tiles*tile_size)
+        """
+        # Render RGB image
+        rgb_img = self.env.render(
+            mode='rgb_array',
+            highlight=False,
+            tile_size=tile_size
+        )  # (height, width, channel)
+
+        rgb_img = np.moveaxis(rgb_img, 2, 0)  # (channel, height, width)
+
+        return rgb_img
 
     # potnetial TODO: add something to go from the observation space to image space for
     # printing image?

@@ -6,16 +6,18 @@
 # ============================================================================
 
 import argparse
+import csv
+import os
 
 import gym
-import numpy as np
-
 from gym_minigrid import wrappers
+import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from flat_wrapper import MiniGridFlatWrapper
-import dqn_flat_agent
+from envs.flat_wrapper import MiniGridFlatWrapper
+import agents.dqn_flat_agent as dqn_flat_agent
+import agents.smi_flat_agent as smi_flat_agent
 
 
 # ========================================
@@ -24,7 +26,7 @@ import dqn_flat_agent
 
 def init_agent(args, env, device='cpu'):
 
-    if args.agent_type is 'dqn_flat':
+    if args.agent_type == 'dqn_flat':
         agent = dqn_flat_agent.DQNFlatAgent(
             num_actions=env.action_space.n,
             observation_shape=env.observation_space.shape,
@@ -37,38 +39,30 @@ def init_agent(args, env, device='cpu'):
             epsilon_final=args.final_exploration,
             epsilon_decay_period=args.eps_decay_duration,
             memory_buffer_capacity=args.buffer_capacity,
-            minibatch_size=args.q_batch_size,
+            q_minibatch_size=args.q_batch_size,
             seed=args.seed,
             device=device,
         )
-    elif args.agent_type is 'smirl_dqn_flat':
-        # TODO add the smirl agent here
-        agent = None
+    elif args.agent_type == 'smirl_dqn_flat':
+        agent = smi_flat_agent.SMiQFlatAgent(
+            num_actions=env.action_space.n,
+            observation_shape=env.observation_space.shape,
+            observation_dtype=torch.float32,
+            history_size=args.history_size,
+            gamma=args.discount_factor,
+            min_replay_history = args.min_replay_history,
+            update_period=args.update_period,
+            target_update_period=args.target_update_frequency,
+            epsilon_final=args.final_exploration,
+            epsilon_decay_period=args.eps_decay_duration,
+            memory_buffer_capacity=args.buffer_capacity,
+            q_minibatch_size=args.q_batch_size,
+            vae_minibatch_size=args.vae_batch_size,
+            seed=args.seed,
+            device=device
+        )
     else:
         agent = None
-
-
-    """
-    TODO delete, below for reference only
-    if AGENT is 'linear':
-        agent = classic_agent.LinearQAgent(n_actions=env.action_space.n,
-                                           obs_shape=env.observation_space.shape,
-                                           gamma=0.9,
-                                           epsilon=0.1,
-                                           lr=0.001)
-    if AGENT is 'smi_fc':
-        agent = smi_flat_agent.FnnQAgent(n_actions=env.action_space.n,
-                                         obs_shape=env.observation_space.shape,
-                                         gamma=0.95,
-                                         seed=args.seed,
-                                         device=DEVICE)
-    else:
-        agent = classic_agent.FnnQAgent(n_actions=env.action_space.n,
-                                        obs_shape=env.observation_space.shape,
-                                        gamma=0.95,
-                                        seed=args.seed,
-                                        device=DEVICE)
-    """
 
     return agent
 
@@ -105,20 +99,61 @@ def run_environment(args: argparse.Namespace,
         cumu_reward = 0.0
         timestep = 0
 
+        # (optional) Record video
+        video = None
+        max_vid_len = 200
+        if args.video_freq is not None:
+            if episode_idx % int(args.video_freq) == 0:
+                # Render first frame and insert to video array
+                frame = env.render()
+                video = np.zeros(shape=((max_vid_len,) + frame.shape),
+                                 dtype=np.uint8)  # (max_vid_len, C, W, H)
+                video[0] = frame
+
         while True:
-            # Iteract
+            # ==
+            # Interact with environment
             observation, reward, done, info = env.step(action)
             action = agent.step(observation, reward, done)
 
+            # ==
+            # Counters
             cumu_reward += reward
             timestep += 1
 
+            # ==
+            # Optional video
+            if video is not None:
+                if timestep < max_vid_len:
+                    video[timestep] = env.render()
+
+            # ==
+            # Episode done
             if done:
                 # Logging
                 if args.log_dir is not None:
+                    # Add reward
                     logger.add_scalar('Reward', cumu_reward,
                                       global_step=episode_idx)
-                    if epis_idx % 10 == 0:
+                    # Optionally add video
+                    if video is not None:
+                        # Determine last frame
+                        last_frame_idx = timestep+2
+                        if last_frame_idx > max_vid_len:
+                            last_frame_idx = max_vid_len
+
+                        # Change to tensor
+                        vid_tensor = torch.tensor(video[:last_frame_idx, :, :, :],
+                                                  dtype=torch.uint8)
+                        vid_tensor = vid_tensor.unsqueeze(0)
+
+                        # Add to tensorboard
+                        logger.add_video('Run_Video', vid_tensor,
+                                         global_step=episode_idx,
+                                         fps=8)
+
+                    # Occasional print
+                    if episode_idx % 100 == 0:
                         print(f'Epis {episode_idx}, Timesteps: {timestep}, Return: {cumu_reward}')
 
                 else:
@@ -162,10 +197,10 @@ if __name__ == "__main__":
                         help='initial e-greedy exploration value (default: 1.0)')
     parser.add_argument('--final_exploration', type=float, default=0.05, metavar='N',
                         help='final e-greedy exploration value (default: 0.05)')
-    parser.add_argument('--eps_decay_duration', type=int, default=100000, metavar='N',
+    parser.add_argument('--eps_decay_duration', type=int, default=50000, metavar='N',
                         help='number of actions over which the initial '
                              'exploration rate is linearly annealed to the '
-                             'final exploration rate (default: 100,000)')
+                             'final exploration rate (default: 50,000)')
 
     parser.add_argument('--min_replay_history', type=int, default=1024, metavar='N',
                         help='number of actions taken (transition stored) '
@@ -188,6 +223,9 @@ if __name__ == "__main__":
 
     parser.add_argument('--log_dir', type=str, default=None, metavar='',
                         help='Path to the log output directory (default: None)')
+    parser.add_argument('--video_freq', type=int, default=None, metavar='',
+                        help='Freq (in # episodes) to record video, only works'
+                             'if log_dir is also provided (default: None)')
     parser.add_argument('--seed', type=int, default=0, metavar='N',
                         help='Seed for rng (default: 0)')
 
@@ -205,9 +243,24 @@ if __name__ == "__main__":
     if args.log_dir is not None:
         # Tensorboard logger
         logger = SummaryWriter(log_dir=args.log_dir)
+
         # Add hyperparameters
-        # TODO this will throw an exception for "none" hyperparmeters
-        logger.add_hparams(hparam_dict=vars(args), metric_dict={})
+        # TODO this will throw an exception for "None" hyperparmeters
+        # NOTE: not using add_hparams due to difficulty in extracting it later
+        # logger.add_hparams(hparam_dict=vars(args), metric_dict={})
+
+        # Write the training parameters to csv
+        hparam_csv_path = os.path.join(args.log_dir, 'training_hparam.csv')
+        with open(hparam_csv_path, 'w') as csvfile:
+            csv_writer = csv.writer(csvfile, delimiter=',')
+
+            hparam_dict = dict(vars(args))
+            for k in hparam_dict:
+                str_v = str(hparam_dict[k])
+
+                # Write to csv
+                csv_writer.writerow([k, str_v])
+
     else:
         logger = None
 

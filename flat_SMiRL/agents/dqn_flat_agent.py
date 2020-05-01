@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
 
 import network
 import flat_replay_memory
@@ -55,7 +56,7 @@ class DQNFlatAgent(object):
                  epsilon_final: float = 0.1,
                  epsilon_decay_period: int = 250000,
                  memory_buffer_capacity: int = 1000000,
-                 minibatch_size: int = 32,
+                 q_minibatch_size: int = 32,
                  seed: int = 42,
                  device: str = 'cpu'):
         """
@@ -99,7 +100,7 @@ class DQNFlatAgent(object):
         self.epsilon_decay_period = epsilon_decay_period
 
         self.memory_buffer_capacity = memory_buffer_capacity
-        self.minibatch_size = minibatch_size
+        self.minibatch_size = q_minibatch_size
         self.seed = seed
         self.device = device
 
@@ -259,7 +260,7 @@ class DQNFlatAgent(object):
         # Epsilon greedy policy
         if random.random() <= epsilon:
             # random action with probability epsilon
-            return random.randrange(self.num_actions)
+            return self.rng.choice(self.num_actions)
         else:
             # Construct state
             state = self._history_queue_to_state()
